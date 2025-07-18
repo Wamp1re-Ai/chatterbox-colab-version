@@ -215,7 +215,7 @@ class ChatterboxTTS:
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
-        max_new_tokens=1000, # TODO: use the value in config
+        max_new_tokens=1000,
     ):
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
