@@ -9,7 +9,7 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 import re
 import gc
-from typing import List, Generator, Optional
+from typing import List, Generator, Optional, Iterator
 import numpy as np
 
 from .models.t3 import T3
@@ -139,6 +139,32 @@ def optimize_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+def smart_sentence_split(text: str) -> List[str]:
+    """
+    IndexTTS-inspired smart sentence splitting that handles various punctuation.
+    """
+    import re
+    
+    # Enhanced sentence splitting pattern that handles multiple languages
+    sentence_pattern = r'(?<=[.!?。！？])\s+|(?<=[.!?。！？])[""\'\'\)\]]*\s+'
+    sentences = re.split(sentence_pattern, text.strip())
+    
+    # Clean up empty sentences and whitespace
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    return sentences
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate the number of tokens in text (rough approximation).
+    """
+    # Simple token estimation: split by whitespace and punctuation
+    import re
+    tokens = re.findall(r'\w+|[^\w\s]', text)
+    return len(tokens)
 
 
 @dataclass
@@ -296,7 +322,26 @@ class ChatterboxTTS:
         cfg_weight=0.5,
         temperature=0.8,
         max_new_tokens=1000,
+        max_mel_tokens=1000,
     ):
+        """
+        Generate audio from text using the loaded model with IndexTTS-inspired optimizations.
+        
+        Args:
+            text: Input text to convert to speech
+            repetition_penalty: Penalty for repetition in generation
+            min_p: Minimum probability threshold
+            top_p: Top-p sampling parameter
+            audio_prompt_path: Path to audio prompt file
+            exaggeration: Exaggeration factor for speech
+            cfg_weight: Classifier-free guidance weight
+            temperature: Sampling temperature
+            max_new_tokens: Maximum number of new tokens to generate
+            max_mel_tokens: Controls the length of generated speech (IndexTTS-inspired)
+        
+        Returns:
+            Generated audio tensor
+        """
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
@@ -324,10 +369,12 @@ class ChatterboxTTS:
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
         with torch.inference_mode():
+            # IndexTTS-inspired: Use max_mel_tokens to control speech generation length
+            effective_max_tokens = min(max_new_tokens, max_mel_tokens)
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=effective_max_tokens,
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 repetition_penalty=repetition_penalty,
@@ -357,6 +404,9 @@ class ChatterboxTTS:
         text: str,
         chunk_method: str = "sentences",
         max_chunk_size: int = 200,
+        max_mel_tokens: int = 1000,
+        max_text_tokens_per_sentence: int = 50,
+        sentences_bucket_max_size: int = 10,
         repetition_penalty: float = 1.2,
         min_p: float = 0.05,
         top_p: float = 1.0,
@@ -368,30 +418,34 @@ class ChatterboxTTS:
         optimize_memory_between_chunks: bool = True,
     ) -> torch.Tensor:
         """
-        Generate audio from long text using chunking and memory optimization.
+        Generate audio from long text using IndexTTS-inspired chunking and memory optimization.
         
         Args:
             text: Input text to convert to speech
-            chunk_method: Method to chunk text ('sentences', 'clauses', or 'character')
+            chunk_method: Method to chunk text ('sentences', 'clauses', 'semantic', or 'character')
             max_chunk_size: Maximum characters per chunk
+            max_mel_tokens: Controls the length of generated speech (IndexTTS-inspired)
+            max_text_tokens_per_sentence: Maximum tokens per sentence for better control
+            sentences_bucket_max_size: Maximum capacity for sentence bucketing
             optimize_memory_between_chunks: Whether to clear memory between chunks
             **kwargs: Other generation parameters
         
         Returns:
             Combined audio tensor
         """
-        # Choose chunking method
+        # IndexTTS-inspired intelligent chunking
         if chunk_method == "sentences":
-            chunks = chunk_text_by_sentences(text, max_chunk_size)
+            chunks = self._chunk_by_sentences_with_bucket(text, max_chunk_size, sentences_bucket_max_size)
         elif chunk_method == "clauses":
             chunks = chunk_text_by_clauses(text, max_chunk_size)
+        elif chunk_method == "semantic":
+            chunks = self._chunk_by_semantic_boundaries(text, max_chunk_size, max_text_tokens_per_sentence)
         elif chunk_method == "character":
-            # Simple character-based chunking as fallback
             chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
         else:
             raise ValueError(f"Unknown chunk_method: {chunk_method}")
         
-        print(f"Processing {len(chunks)} chunks with {chunk_method} method...")
+        print(f"Processing {len(chunks)} chunks with {chunk_method} method (max_mel_tokens: {max_mel_tokens})...")
         
         audio_chunks = []
         
@@ -436,11 +490,109 @@ class ChatterboxTTS:
         print(f"Successfully generated {combined_audio.shape[-1] / self.sr:.2f} seconds of audio")
         return combined_audio
 
+    def _chunk_by_sentences_with_bucket(self, text: str, max_chunk_size: int, bucket_max_size: int) -> List[str]:
+        """
+        IndexTTS-inspired sentence bucketing for optimal chunking.
+        """
+        sentences = smart_sentence_split(text)
+        chunks = []
+        current_chunk = ""
+        sentence_bucket = []
+        
+        for sentence in sentences:
+            sentence_bucket.append(sentence)
+            
+            # Check if bucket is full or if adding would exceed chunk size
+            if (len(sentence_bucket) >= bucket_max_size or 
+                len(" ".join(sentence_bucket)) > max_chunk_size):
+                
+                # Process the bucket
+                bucket_text = " ".join(sentence_bucket[:-1]) if len(sentence_bucket) > 1 else sentence_bucket[0]
+                
+                if current_chunk and len(current_chunk) + len(bucket_text) + 1 > max_chunk_size:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = bucket_text
+                else:
+                    if current_chunk:
+                        current_chunk += " " + bucket_text
+                    else:
+                        current_chunk = bucket_text
+                
+                # Keep the last sentence for next bucket if we removed it
+                sentence_bucket = sentence_bucket[-1:] if len(sentence_bucket) > 1 else []
+        
+        # Process remaining sentences in bucket
+        if sentence_bucket:
+            bucket_text = " ".join(sentence_bucket)
+            if current_chunk and len(current_chunk) + len(bucket_text) + 1 > max_chunk_size:
+                chunks.append(current_chunk.strip())
+                current_chunk = bucket_text
+            else:
+                if current_chunk:
+                    current_chunk += " " + bucket_text
+                else:
+                    current_chunk = bucket_text
+        
+        # Add the last chunk
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return [chunk for chunk in chunks if chunk]
+
+    def _chunk_by_semantic_boundaries(self, text: str, max_chunk_size: int, max_tokens_per_sentence: int) -> List[str]:
+        """
+        IndexTTS-inspired semantic boundary detection for natural speech flow.
+        """
+        import re
+        
+        sentences = smart_sentence_split(text)
+        chunks = []
+        current_chunk = ""
+        
+        for sentence in sentences:
+            # Estimate tokens in sentence
+            sentence_tokens = estimate_tokens(sentence)
+            
+            # If sentence is too long, split it further
+            if sentence_tokens > max_tokens_per_sentence:
+                # Split by clauses within the sentence
+                clause_pattern = r'(?<=,)\s+|(?<=;)\s+|(?<=:)\s+'
+                clauses = re.split(clause_pattern, sentence)
+                
+                for clause in clauses:
+                    if current_chunk and len(current_chunk) + len(clause) + 1 > max_chunk_size:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = clause
+                    else:
+                        if current_chunk:
+                            current_chunk += " " + clause
+                        else:
+                            current_chunk = clause
+            else:
+                # Normal sentence processing
+                if current_chunk and len(current_chunk) + len(sentence) + 1 > max_chunk_size:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = sentence
+                else:
+                    if current_chunk:
+                        current_chunk += " " + sentence
+                    else:
+                        current_chunk = sentence
+        
+        # Add the last chunk
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return [chunk for chunk in chunks if chunk]
+
     def generate_streaming(
         self,
         text: str,
         chunk_method: str = "sentences",
         max_chunk_size: int = 200,
+        max_mel_tokens: int = 1000,
+        max_text_tokens_per_sentence: int = 50,
+        sentences_bucket_max_size: int = 10,
         repetition_penalty: float = 1.2,
         min_p: float = 0.05,
         top_p: float = 1.0,
@@ -449,7 +601,8 @@ class ChatterboxTTS:
         cfg_weight: float = 0.5,
         temperature: float = 0.8,
         max_new_tokens: int = 1000,
-    ) -> Generator[torch.Tensor, None, None]:
+        optimize_memory_between_chunks: bool = True,
+    ) -> Iterator[torch.Tensor]:
         """
         Generate audio from long text in streaming fashion.
         Yields audio chunks as they are generated to reduce memory usage.
@@ -463,17 +616,19 @@ class ChatterboxTTS:
         Yields:
             Audio tensor for each chunk
         """
-        # Choose chunking method
+        # IndexTTS-inspired intelligent chunking
         if chunk_method == "sentences":
-            chunks = chunk_text_by_sentences(text, max_chunk_size)
+            chunks = self._chunk_by_sentences_with_bucket(text, max_chunk_size, sentences_bucket_max_size)
         elif chunk_method == "clauses":
             chunks = chunk_text_by_clauses(text, max_chunk_size)
+        elif chunk_method == "semantic":
+            chunks = self._chunk_by_semantic_boundaries(text, max_chunk_size, max_text_tokens_per_sentence)
         elif chunk_method == "character":
             chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
         else:
             raise ValueError(f"Unknown chunk_method: {chunk_method}")
         
-        print(f"Streaming {len(chunks)} chunks with {chunk_method} method...")
+        print(f"Streaming {len(chunks)} chunks with {chunk_method} method (max_mel_tokens: {max_mel_tokens})...")
         
         for i, chunk in enumerate(chunks):
             print(f"Streaming chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...")
@@ -494,40 +649,66 @@ class ChatterboxTTS:
                 
                 yield chunk_audio
                 
-                # Clean up memory after yielding
-                optimize_memory()
+                # Optimize memory between chunks
+                if optimize_memory_between_chunks and i < len(chunks) - 1:
+                    optimize_memory()
                 
             except Exception as e:
                 print(f"Error processing chunk {i+1}: {str(e)}")
                 continue
 
-    def estimate_memory_usage(self, text: str, max_new_tokens: int = 1000) -> dict:
+    def estimate_memory_usage(self, text: str, max_new_tokens: int = 1000, chunk_method: str = "sentences") -> dict:
         """
-        Estimate memory usage for generating audio from given text.
+        Estimate memory usage for generating audio from given text with improved accuracy.
         
         Args:
             text: Input text
             max_new_tokens: Maximum tokens to generate
+            chunk_method: Chunking method to use
         
         Returns:
             Dictionary with memory estimates
         """
         text_length = len(text)
-        estimated_tokens = min(text_length // 4, max_new_tokens)  # Rough estimate
+        estimated_text_tokens = estimate_tokens(text)
+        estimated_speech_tokens = min(estimated_text_tokens * 8, max_new_tokens)  # More accurate estimate
         
-        # Rough memory estimates based on model size and sequence length
-        base_memory_mb = 2000  # Base model memory
-        token_memory_mb = estimated_tokens * 0.1  # Memory per token
-        audio_memory_mb = estimated_tokens * 0.05  # Audio generation memory
+        # More accurate memory estimates based on model architecture
+        base_memory_mb = 2500  # Base model memory (T3 + S3Gen + VE)
+        text_processing_mb = estimated_text_tokens * 0.02  # Text tokenization and processing
+        speech_generation_mb = estimated_speech_tokens * 0.15  # Speech token generation
+        audio_synthesis_mb = estimated_speech_tokens * 0.08  # Audio synthesis from tokens
+        watermarking_mb = (estimated_speech_tokens * self.sr // 1000) * 0.001  # Watermarking overhead
         
-        total_estimated_mb = base_memory_mb + token_memory_mb + audio_memory_mb
+        total_estimated_mb = (
+            base_memory_mb + text_processing_mb + 
+            speech_generation_mb + audio_synthesis_mb + watermarking_mb
+        )
+        
+        # Calculate optimal chunk size based on available memory and method
+        if chunk_method == "sentences":
+            base_chunk_size = 150
+        elif chunk_method == "semantic":
+            base_chunk_size = 200
+        elif chunk_method == "clauses":
+            base_chunk_size = 120
+        else:
+            base_chunk_size = 100
+            
+        memory_factor = max(0.5, min(2.0, 4000 / total_estimated_mb))
+        recommended_chunk_size = int(base_chunk_size * memory_factor)
         
         return {
             "text_length": text_length,
-            "estimated_tokens": estimated_tokens,
+            "estimated_text_tokens": estimated_text_tokens,
+            "estimated_speech_tokens": estimated_speech_tokens,
             "base_memory_mb": base_memory_mb,
-            "token_memory_mb": token_memory_mb,
-            "audio_memory_mb": audio_memory_mb,
+            "text_processing_mb": text_processing_mb,
+            "speech_generation_mb": speech_generation_mb,
+            "audio_synthesis_mb": audio_synthesis_mb,
+            "watermarking_mb": watermarking_mb,
             "total_estimated_mb": total_estimated_mb,
-            "recommended_chunk_size": max(50, min(500, 8000 // (total_estimated_mb // 1000 + 1)))
+            "recommended_chunk_size": max(50, min(500, recommended_chunk_size)),
+            "estimated_audio_duration_seconds": estimated_speech_tokens * 0.02,  # Rough duration estimate
+            "memory_efficiency_score": min(100, max(0, 100 - (total_estimated_mb - 3000) / 50))
         }
