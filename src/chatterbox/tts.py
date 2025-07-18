@@ -7,6 +7,10 @@ import perth
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
+import re
+import gc
+from typing import List, Generator, Optional
+import numpy as np
 
 from .models.t3 import T3
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
@@ -59,6 +63,82 @@ def punc_norm(text: str) -> str:
         text += "."
 
     return text
+
+
+def chunk_text_by_sentences(text: str, max_chunk_size: int = 200) -> List[str]:
+    """
+    Split text into chunks by sentence boundaries while respecting max_chunk_size.
+    Preserves natural speech patterns for better TTS quality.
+    """
+    # Split by sentence boundaries (periods, question marks, exclamation points)
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        # If adding this sentence would exceed max_chunk_size, start a new chunk
+        if current_chunk and len(current_chunk) + len(sentence) + 1 > max_chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence
+        else:
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+    
+    # Add the last chunk if it exists
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    
+    return [chunk for chunk in chunks if chunk]  # Remove empty chunks
+
+
+def chunk_text_by_clauses(text: str, max_chunk_size: int = 200) -> List[str]:
+    """
+    Split text by clauses and sentence boundaries for more natural speech.
+    Uses grammatical rules to identify natural breakpoints.
+    """
+    # Pattern to split on:
+    # 1. Sentence endings: . ? ! ;
+    # 2. Comma + coordinating conjunctions: , and|but|or|nor|for|yet|so
+    pattern = r'(?<=[.!?;])\s+|(?<=,)\s+(?=(?:and|but|or|nor|for|yet|so)\s)'
+    
+    clauses = re.split(pattern, text.strip())
+    
+    chunks = []
+    current_chunk = ""
+    
+    for clause in clauses:
+        clause = clause.strip()
+        if not clause:
+            continue
+            
+        # If adding this clause would exceed max_chunk_size, start a new chunk
+        if current_chunk and len(current_chunk) + len(clause) + 1 > max_chunk_size:
+            chunks.append(current_chunk.strip())
+            current_chunk = clause
+        else:
+            if current_chunk:
+                current_chunk += " " + clause
+            else:
+                current_chunk = clause
+    
+    # Add the last chunk if it exists
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    
+    return [chunk for chunk in chunks if chunk]  # Remove empty chunks
+
+
+def optimize_memory():
+    """
+    Force garbage collection and clear CUDA cache to free up memory.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 @dataclass
@@ -271,3 +351,183 @@ class ChatterboxTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_long_text(
+        self,
+        text: str,
+        chunk_method: str = "sentences",
+        max_chunk_size: int = 200,
+        repetition_penalty: float = 1.2,
+        min_p: float = 0.05,
+        top_p: float = 1.0,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.5,
+        cfg_weight: float = 0.5,
+        temperature: float = 0.8,
+        max_new_tokens: int = 1000,
+        optimize_memory_between_chunks: bool = True,
+    ) -> torch.Tensor:
+        """
+        Generate audio from long text using chunking and memory optimization.
+        
+        Args:
+            text: Input text to convert to speech
+            chunk_method: Method to chunk text ('sentences', 'clauses', or 'character')
+            max_chunk_size: Maximum characters per chunk
+            optimize_memory_between_chunks: Whether to clear memory between chunks
+            **kwargs: Other generation parameters
+        
+        Returns:
+            Combined audio tensor
+        """
+        # Choose chunking method
+        if chunk_method == "sentences":
+            chunks = chunk_text_by_sentences(text, max_chunk_size)
+        elif chunk_method == "clauses":
+            chunks = chunk_text_by_clauses(text, max_chunk_size)
+        elif chunk_method == "character":
+            # Simple character-based chunking as fallback
+            chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
+        else:
+            raise ValueError(f"Unknown chunk_method: {chunk_method}")
+        
+        print(f"Processing {len(chunks)} chunks with {chunk_method} method...")
+        
+        audio_chunks = []
+        
+        for i, chunk in enumerate(chunks):
+            print(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...")
+            
+            try:
+                # Generate audio for this chunk
+                chunk_audio = self.generate(
+                    text=chunk,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                    audio_prompt_path=audio_prompt_path if i == 0 else None,  # Only use prompt for first chunk
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                )
+                
+                audio_chunks.append(chunk_audio)
+                
+                # Optimize memory between chunks
+                if optimize_memory_between_chunks and i < len(chunks) - 1:
+                    optimize_memory()
+                    
+            except Exception as e:
+                print(f"Error processing chunk {i+1}: {str(e)}")
+                # Continue with next chunk instead of failing completely
+                continue
+        
+        if not audio_chunks:
+            raise RuntimeError("Failed to generate audio for any chunks")
+        
+        # Concatenate all audio chunks
+        combined_audio = torch.cat(audio_chunks, dim=-1)
+        
+        # Final memory cleanup
+        if optimize_memory_between_chunks:
+            optimize_memory()
+        
+        print(f"Successfully generated {combined_audio.shape[-1] / self.sr:.2f} seconds of audio")
+        return combined_audio
+
+    def generate_streaming(
+        self,
+        text: str,
+        chunk_method: str = "sentences",
+        max_chunk_size: int = 200,
+        repetition_penalty: float = 1.2,
+        min_p: float = 0.05,
+        top_p: float = 1.0,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.5,
+        cfg_weight: float = 0.5,
+        temperature: float = 0.8,
+        max_new_tokens: int = 1000,
+    ) -> Generator[torch.Tensor, None, None]:
+        """
+        Generate audio from long text in streaming fashion.
+        Yields audio chunks as they are generated to reduce memory usage.
+        
+        Args:
+            text: Input text to convert to speech
+            chunk_method: Method to chunk text ('sentences', 'clauses', or 'character')
+            max_chunk_size: Maximum characters per chunk
+            **kwargs: Other generation parameters
+        
+        Yields:
+            Audio tensor for each chunk
+        """
+        # Choose chunking method
+        if chunk_method == "sentences":
+            chunks = chunk_text_by_sentences(text, max_chunk_size)
+        elif chunk_method == "clauses":
+            chunks = chunk_text_by_clauses(text, max_chunk_size)
+        elif chunk_method == "character":
+            chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
+        else:
+            raise ValueError(f"Unknown chunk_method: {chunk_method}")
+        
+        print(f"Streaming {len(chunks)} chunks with {chunk_method} method...")
+        
+        for i, chunk in enumerate(chunks):
+            print(f"Streaming chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...")
+            
+            try:
+                # Generate audio for this chunk
+                chunk_audio = self.generate(
+                    text=chunk,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                    audio_prompt_path=audio_prompt_path if i == 0 else None,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                )
+                
+                yield chunk_audio
+                
+                # Clean up memory after yielding
+                optimize_memory()
+                
+            except Exception as e:
+                print(f"Error processing chunk {i+1}: {str(e)}")
+                continue
+
+    def estimate_memory_usage(self, text: str, max_new_tokens: int = 1000) -> dict:
+        """
+        Estimate memory usage for generating audio from given text.
+        
+        Args:
+            text: Input text
+            max_new_tokens: Maximum tokens to generate
+        
+        Returns:
+            Dictionary with memory estimates
+        """
+        text_length = len(text)
+        estimated_tokens = min(text_length // 4, max_new_tokens)  # Rough estimate
+        
+        # Rough memory estimates based on model size and sequence length
+        base_memory_mb = 2000  # Base model memory
+        token_memory_mb = estimated_tokens * 0.1  # Memory per token
+        audio_memory_mb = estimated_tokens * 0.05  # Audio generation memory
+        
+        total_estimated_mb = base_memory_mb + token_memory_mb + audio_memory_mb
+        
+        return {
+            "text_length": text_length,
+            "estimated_tokens": estimated_tokens,
+            "base_memory_mb": base_memory_mb,
+            "token_memory_mb": token_memory_mb,
+            "audio_memory_mb": audio_memory_mb,
+            "total_estimated_mb": total_estimated_mb,
+            "recommended_chunk_size": max(50, min(500, 8000 // (total_estimated_mb // 1000 + 1)))
+        }
