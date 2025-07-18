@@ -20,6 +20,9 @@ If you like the model but need to scale or tune it for higher accuracy, check ou
 - SoTA zeroshot TTS
 - 0.5B Llama backbone
 - Unique exaggeration/intensity control
+- **NEW: IndexTTS-inspired long text generation with advanced chunking**
+- **NEW: Memory usage estimation and optimization**
+- **NEW: Streaming audio generation**
 - Ultra-stable with alignment-informed inference
 - Trained on 0.5M hours of cleaned data
 - Watermarked outputs
@@ -54,6 +57,24 @@ We developed and tested Chatterbox on Python 3.11 on Debain 11 OS; the versions 
 
 
 # Usage
+
+## 🚨 IMPORTANT: AttributeError Fix
+
+If you get `'ChatterboxTTS' object has no attribute 'generate_long_text'`, this is due to Python's import cache. **SOLUTION:**
+
+1. **Restart your Python interpreter/kernel**
+2. Clear import cache:
+   ```python
+   import sys
+   modules_to_remove = [key for key in sys.modules.keys() if key.startswith('chatterbox')]
+   for module in modules_to_remove:
+       del sys.modules[module]
+   ```
+3. Re-import and use the model
+
+Run `python verify_generate_long_text.py` to diagnose and fix this issue.
+
+## Basic Usage
 ```python
 import torchaudio as ta
 from chatterbox.tts import ChatterboxTTS
@@ -69,7 +90,43 @@ AUDIO_PROMPT_PATH = "YOUR_FILE.wav"
 wav = model.generate(text, audio_prompt_path=AUDIO_PROMPT_PATH)
 ta.save("test-2.wav", wav, model.sr)
 ```
-See `example_tts.py` and `example_vc.py` for more examples.
+
+## 🆕 Long Text Generation (IndexTTS-Inspired)
+
+For ultra-long texts, use the new `generate_long_text` method with advanced chunking:
+
+```python
+# Long text with memory optimization
+long_text = """Your very long text here... This can be thousands of characters long.
+The system will intelligently chunk it while preserving natural speech patterns."""
+
+# Estimate memory usage first
+memory_info = model.estimate_memory_usage(long_text)
+print(f"Estimated memory: {memory_info['total_estimated_mb']:.0f}MB")
+print(f"Recommended chunk size: {memory_info['recommended_chunk_size']}")
+
+# Generate with advanced chunking
+wav = model.generate_long_text(
+    text=long_text,
+    chunk_method="semantic",  # 'sentences', 'semantic', 'clauses', 'character'
+    max_mel_tokens=1000,      # IndexTTS-inspired parameter
+    sentences_bucket_max_size=10,  # Group sentences intelligently
+    optimize_memory_between_chunks=True,
+    max_chunk_size=200
+)
+ta.save("long-audio.wav", wav, model.sr)
+```
+
+## 🔄 Streaming Generation
+
+```python
+# Stream audio generation for real-time applications
+for audio_chunk in model.generate_streaming(text):
+    # Process each chunk as it's generated
+    ta.save(f"chunk_{i}.wav", audio_chunk, model.sr)
+```
+
+See `example_tts.py`, `example_vc.py`, `example_long_audio.py`, and `test_chunking.py` for more examples.
 
 # Supported Lanugage
 Currenlty only English.
